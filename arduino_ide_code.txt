@@ -1,0 +1,146 @@
+/************************* Libraries **************************/
+#include <Wire.h>
+#include <SPI.h>
+#include "DFRobot_BME680_I2C.h"
+#include <SoftwareSerial.h>
+
+/************************* Pins ******************************/
+#define MG_PIN        A0     // MG-811 analog output
+#define BOOL_PIN      2      // MG-811 digital alarm
+#define MQ7_PIN       A1     // MQ-7 analog pin
+
+#define SEN0233_RX    10     // SoftwareSerial RX
+#define SEN0233_TX    11     // SoftwareSerial TX
+
+/************************* MG-811 / MQ-7 Config **************/
+#define DC_GAIN 8.5
+#define READ_SAMPLE_INTERVAL 50
+#define READ_SAMPLE_TIMES    5
+#define ZERO_POINT_VOLTAGE 0.30
+#define REACTION_VOLTGAE   0.030
+
+float Ro = 205.0;   // MQ-7 calibrated value
+float CO2Curve[3]  = {2.602, ZERO_POINT_VOLTAGE, (REACTION_VOLTGAE/(2.602-3))};
+
+#define RL 10000.0   // resistor de carga real do MQ-7 em ohms (ajuste conforme o hardware)
+
+/************************* SEN0233 Variables ******************/
+SoftwareSerial senSerial(SEN0233_RX, SEN0233_TX);
+unsigned char bufferRTT[32];
+unsigned int PMS1=0, PMS2_5=0, PMS10=0, TPS=0, HDS=0;
+
+/************************* BME680 Setup ***********************/
+DFRobot_BME680_I2C bme(0x77);
+float seaLevel;
+
+/************************* Function Prototypes ***************/
+float MGRead(int pin);
+int MGGetPercentage(float volts, float *pcurve);
+
+/************************* Setup ******************************/
+void setup() {
+  Serial.begin(115200);
+  pinMode(BOOL_PIN, INPUT);
+  digitalWrite(BOOL_PIN, HIGH);  // internal pull-up
+
+  senSerial.begin(9600);
+
+  Serial.println("Dor MG-811 + MQ-7 + SEN0233 + BME680 Started");
+  Serial.println("MG-811 Warm-up required: Wait at least 2 hours");
+  Serial.print("Using MQ-7 Ro value: ");
+  Serial.println(Ro,2);
+
+  // BME680 Init
+  if(bme.begin()) {
+    #ifdef CALIBRATE_PRESSURE
+      bme.startConvert();
+      delay(1000);
+      bme.update();
+      seaLevel = bme.readSeaLevel(104.0);
+      Serial.print("BME680 seaLevel : ");
+      Serial.println(seaLevel);
+    #endif
+  } else {
+      Serial.println("BME680 not detected!");
+  }
+}
+
+/************************* Loop *******************************/
+void loop() {
+  Serial.println("---------------------------------------------------");
+
+  // -------- MG-811 ------------
+  float volts = MGRead(MG_PIN);
+  int co2ppm = MGGetPercentage(volts, CO2Curve);
+  Serial.print("MG-811 | Voltage: "); Serial.print(volts); Serial.print(" V | CO2: ");
+  if(co2ppm == -1) Serial.print("400"); else Serial.print(co2ppm);
+  Serial.print(" ppm | Alarm: "); Serial.println(digitalRead(BOOL_PIN) ? "OFF" : "ON");
+
+  // -------- MQ-7 -------------
+  int analog_value = analogRead(MQ7_PIN);
+  float sensor_voltage = (analog_value / 1023.0) * 5.0;
+  float Rs = (5.0 - sensor_voltage) / sensor_voltage * RL;
+  float ratio = Rs / Ro;
+  float co_ppm = 100 * pow(ratio, -1.5);
+  Serial.print("MQ-7  | Analog: "); Serial.print(analog_value);
+  Serial.print(" | Rs: "); Serial.print(Rs); Serial.print(" Ω");
+  Serial.print(" | Ratio: "); Serial.print(ratio);
+  Serial.print(" | CO: "); Serial.print(co_ppm); Serial.println(" ppm | Alarm: OFF");
+
+  // -------- SEN0233 ------------
+  while (senSerial.available() >= 32) {
+    for(int i=0; i<32; i++) bufferRTT[i] = senSerial.read();
+    unsigned int CR1 = (bufferRTT[30] << 8) + bufferRTT[31];
+    unsigned int CR2 = 0;
+    for(int i=0;i<30;i++) CR2 += bufferRTT[i];
+
+    if(CR1 == CR2) {
+      PMS1   = (bufferRTT[10] << 8) + bufferRTT[11];
+      PMS2_5 = (bufferRTT[12] << 8) + bufferRTT[13];
+      PMS10  = (bufferRTT[14] << 8) + bufferRTT[15];
+      TPS    = (bufferRTT[24] << 8) + bufferRTT[25];
+      HDS    = (bufferRTT[26] << 8) + bufferRTT[27];
+    } else {
+      PMS1 = PMS2_5 = 0;
+    }
+  }
+  Serial.println("-----------------SEN0233----------------------------");
+  Serial.print("Temp : "); Serial.println(TPS / 10.0);      // °C
+  Serial.print("Humidity: "); Serial.println(HDS / 10.0);  // %RH
+  Serial.print("PM1.0 : "); Serial.println(PMS1);
+  Serial.print("PM2.5 : "); Serial.println(PMS2_5);
+  Serial.print("PM10  : "); Serial.println(PMS10);
+
+  // -------- BME680 ------------
+  bme.startConvert();
+  delay(1000);
+  bme.update();
+  Serial.println("-----------------BME680----------------------------");
+  Serial.print("Temperature(C) : "); Serial.println(bme.readTemperature() / 100.0, 2);
+  Serial.print("Pressure(Pa)    : "); Serial.println(bme.readPressure());
+  Serial.print("Humidity(%rh)   : "); Serial.println(bme.readHumidity() / 1000.0, 2);
+  Serial.print("Gas(ohm)       : "); Serial.println(bme.readGasResistance());
+  Serial.print("Altitude(m)    : "); Serial.println(bme.readAltitude());
+  #ifdef CALIBRATE_PRESSURE
+    Serial.print("Calibrated Altitude(m): "); Serial.println(bme.readCalibratedAltitude(seaLevel));
+  #endif
+
+  Serial.println("END OF READING");
+  delay(10000); // main loop delay
+}
+
+/**************** MG-811 Functions ******************/
+float MGRead(int mg_pin) {
+  float v=0;
+  for(int i=0;i<READ_SAMPLE_TIMES;i++){
+    v += analogRead(mg_pin);
+    delay(READ_SAMPLE_INTERVAL);
+  }
+  v = (v/READ_SAMPLE_TIMES) * 5.0 / 1024.0;
+  return v;
+}
+
+int MGGetPercentage(float volts, float *pcurve) {
+  if ((volts / DC_GAIN) >= ZERO_POINT_VOLTAGE) return -1;
+  return pow(10, ((volts / DC_GAIN) - pcurve[1]) / pcurve[2] + pcurve[0]);
+}
